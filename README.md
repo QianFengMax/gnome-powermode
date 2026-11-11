@@ -115,6 +115,44 @@ OSD 可见时 `setLevel()` 走 `ease_property` 做 100ms 过渡。快速连按�
 上一轮的过渡还在跑，会持续把 `value` 拉回旧档位，出现「性能档只填 2/3」。
 需要先 `remove_transition('value')` 再硬设。
 
+
+## 与 uperf 调频守护的配合
+
+这台机器（以及许多装了 uperf-linux 的 ARM 设备）上，电源管理分两层：
+
+| 层 | 谁提供 | 作用 |
+|---|---|---|
+| UPower PowerProfiles | tlp-pd | **只是状态标记**，切换不改变任何 CPU 参数 |
+| uperf-linux | 系统级调频守护 | **真正控制** 每簇 scaling_max_freq |
+
+实测：uperf 从 balance 切到 performance 会把 policy0 上限从 1459MHz
+抬到 2016MHz、policy7 从 2093MHz 抬到 2957MHz；而只切 GNOME 档位则毫无变化。
+
+所以扩展在切换档位时会同时调用 uperf 的 D-Bus `SetMode`。
+命名不一致，映射关系是：
+
+| GNOME (UPower) | uperf |
+|---|---|
+| `power-saver` | `powersave` |
+| `balanced` | `balance` |
+| `performance` | `performance` |
+
+首次按键会探测 uperf 是否存在，缺失则静默降级，只切 GNOME 档位。
+运行中掉线会重置探测状态，下次按键重试。
+
+设置页有「同步 uperf 调频守护」开关（默认开）。关掉后只切 GNOME 档位，
+适合想自己用 `uperfctl` 手动控制调频的场景。
+
+### 验证
+
+```bash
+# uperf 当前模式
+busctl --system get-property org.uperflinux.Daemon /org/uperflinux/Daemon   org.uperflinux.Daemon CurrentMode
+
+# CPU 上限是否真的变了
+cat /sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq
+```
+
 ## 已知限制
 
 - 如果底层后端（如 TLP 在部分 ARM 设备上）没有真正接管 CPU 调频，
