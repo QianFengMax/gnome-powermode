@@ -34,6 +34,14 @@ export default class PowerModePrefs extends ExtensionPreferences {
             Gio.SettingsBindFlags.DEFAULT);
         behavior.add(notifyRow);
 
+        const uperfRow = new Adw.SwitchRow({
+            title: '同步 uperf 调频守护',
+            subtitle: '系统装有 uperf-linux 时，切换档位同时调整它的模式（真正控制 CPU 频率）',
+        });
+        settings.bind('sync-uperf', uperfRow, 'active',
+            Gio.SettingsBindFlags.DEFAULT);
+        behavior.add(uperfRow);
+
         const about = new Adw.PreferencesGroup();
         about.add(new Adw.ActionRow({
             title: '循环顺序',
