@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.powermode"
+          path="/org/gnome/shell/extensions/powermode/">
+
+    <key name="toggle-shortcut" type="as">
+      <default><![CDATA[['F24']]]></default>
+      <summary>切换电源模式</summary>
+      <description>按一下在可用电源模式之间循环。GTK 加速器写法，如 F24 或 &lt;Super&gt;p。</description>
+    </key>
+
+    <key name="show-notification" type="b">
+      <default>true</default>
+      <summary>切换后显示通知</summary>
+      <description>关闭后切换不弹提示。</description>
+    </key>
+
+  </schema>
+</schemalist>
