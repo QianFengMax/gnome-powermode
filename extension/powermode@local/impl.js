@@ -45,26 +45,36 @@ const META = {
 const FALLBACK = ['power-saver', 'balanced', 'performance'];
 
 /**
- * uperf-linux 适配。
+ * 调频交给自研守护进程（替代 uperf-linux）。
  *
  * 这台机器上电源管理分两层：
  *   - UPower PowerProfiles（GNOME 认的那个）：tlp-pd 提供的只是状态标记，
- *     切换它不会改变任何 CPU 参数。
- *   - uperf-linux（系统级调频守护）：真正控制每簇 scaling_max_freq。
+ *     切换它不改变任何 CPU 参数。
+ *   - powermode-daemon：真正控制每簇 scaling_max_freq。
  *
- * 实测：uperf 从 balance 切到 performance 会把 policy0 上限从 1459MHz
- * 抬到 2016MHz、policy7 从 2093MHz 抬到 2957MHz；GNOME 档位切了则毫无变化。
- * 所以切换时两边都要动，否则界面显示变了、功耗没变。
+ * 所以切换档位时两边都要动，否则界面显示变了、功耗没变。
  *
- * 命名也不一致，需要映射。uperf 通过系统 D-Bus 的 SetMode 设值，
- * 普通用户可直接调用（polkit 允许 active 会话）。
+ * 与守护进程的通信是单向文件（见下方常量说明），扩展只写不读，
+ * 不需要 D-Bus 调用，也不需要额外权限。
  */
-const UPERF_NAME = 'org.uperflinux.Daemon';
-const UPERF_PATH = '/org/uperflinux/Daemon';
-const UPERF_IFACE = 'org.uperflinux.Daemon';
+/**
+ * 自研守护进程的状态文件（替代 uperf）。
+ *
+ * 协议是单向文件，扩展只写不读：
+ *   extension-enabled  扩展自身是否启用
+ *   daemon-enabled     用户是否点了启动按钮
+ *   mode               当前档位
+ *
+ * 守护进程用 inotify 监听目录，空闲时线程阻塞在 read() 上，零 CPU。
+ * 门控：两个 enabled 都为 1 才运行；扩展关闭时守护进程退出并摘掉自启。
+ */
+const DAEMON_DIR = '/run/powermode';
+const F_EXT_ENABLED = '/run/powermode/extension-enabled';
+const F_DAEMON_ENABLED = '/run/powermode/daemon-enabled';
+const F_MODE = '/run/powermode/mode';
 
-/** GNOME 档位 -> uperf 模式 */
-const UPERF_ALIAS = {
+/** GNOME 档位 -> 守护进程的 mode 字符串 */
+const MODE_ALIAS = {
     'power-saver': 'powersave',
     'balanced': 'balance',
     'performance': 'performance',
@@ -92,12 +102,14 @@ export class Impl {
         this._proxy.init_async(GLib.PRIORITY_DEFAULT, null);
 
         this._bind();
+        this._markExtensionEnabled(true);
     }
 
     disable() {
         this._unbind();
         this._proxy = null;
         this._settings = null;
+        this._markExtensionEnabled(false);
     }
 
     _bind() {
@@ -178,7 +190,7 @@ export class Impl {
                     logError(e, 'powermode: 切换电源模式失败');
                     return;
                 }
-                this._syncUperf(next);
+                this._syncDaemon(next);
                 this._showOsd(next);
             });
     }
@@ -207,70 +219,61 @@ export class Impl {
         // 内联样式是挂在 actor 上的，放在后面照样对后续重算生效。
         this._prepareBars(meta.color, list.length, idx + 1);
     }
-
     /**
-     * 把档位同步给 uperf。
+     * 把档位写进守护进程的 mode 文件。
      *
-     * 为什么需要：GNOME 的 PowerProfiles 在这台机器上只标记不执行，
-     * 真正调频的是 uperf。不同步的话按快捷键只有界面在动。
+     * 只写文件，不做 D-Bus 调用：守护进程用 inotify 监听目录，
+     * 文件一变就立刻重算频率。扩展侧不需要任何权限。
      *
-     * uperf 没装/没运行时不报错也不提示，静默跳过——那样扩展退回
-     * 原本的「只切 GNOME 档位」行为，不影响没有 uperf 的机器。
+     * 守护进程没在跑时写也无害，它下次启动会读到最新值。
      */
-    _syncUperf(profile) {
+    _syncDaemon(profile) {
         if (!this._settings?.get_boolean('sync-uperf'))
             return;
 
-        const mode = UPERF_ALIAS[profile];
-        if (!mode || this._uperfState === 'absent')
+        const mode = MODE_ALIAS[profile];
+        if (!mode)
             return;
 
-        // 'unknown' 时先探一次，避免每次按键都对不存在的服务发起调用
-        if (this._uperfState === 'unknown') {
-            this._uperfState = 'probing';
-            Gio.DBus.system.call(
-                UPERF_NAME, UPERF_PATH, 'org.freedesktop.DBus.Properties', 'Get',
-                new GLib.Variant('(ss)', [UPERF_IFACE, 'CurrentMode']),
-                null, Gio.DBusCallFlags.NONE, 500, null,
-                (conn, res) => {
-                    try {
-                        conn.call_finish(res);
-                        this._uperfState = 'present';
-                        console.log('[powermode] 检测到 uperf，接管调频');
-                        this._sendUperf(mode);
-                    } catch {
-                        this._uperfState = 'absent';
-                        console.log('[powermode] 无 uperf，仅切换 GNOME 档位');
-                    }
-                });
-            return;
-        }
-
-        this._sendUperf(mode);
+        this._writeState(F_MODE, mode);
     }
 
-    _sendUperf(mode) {
+    /**
+     * 标记扩展自身是否启用。
+     *
+     * 守护进程靠这个判断「用户还需要我吗」：为 0 时它恢复 CPU 后退出，
+     * 并把自己从开机自启里摘掉——扩展都关了，开机再拉起来没意义。
+     */
+    _markExtensionEnabled(on) {
+        this._writeState(F_EXT_ENABLED, on ? '1' : '0');
+    }
+
+    /**
+     * 请求守护进程启停（供设置页按钮调用）。
+     *
+     * 这只是「请求」：写文件后守护进程自己决定何时响应。
+     * 真正拉起系统服务需要 pkexec，由设置页发起。
+     */
+    _setDaemonEnabled(on) {
+        return this._writeState(F_DAEMON_ENABLED, on ? '1' : '0');
+    }
+
+    /** 原子写状态文件；目录不存在说明守护进程从没跑过，直接忽略。 */
+    _writeState(path, value) {
         try {
-            Gio.DBus.system.call(
-                UPERF_NAME, UPERF_PATH, UPERF_IFACE, 'SetMode',
-                new GLib.Variant('(s)', [mode]),
-                null, Gio.DBusCallFlags.NONE, 800, null,
-                (conn, res) => {
-                    try {
-                        conn.call_finish(res);
-                    } catch (e) {
-                        // 运行中掉线：下次按键重新探一次
-                        this._uperfState = 'unknown';
-                        console.warn('[powermode] uperf SetMode 失败: ' + e.message);
-                    }
-                });
+            if (!Gio.File.new_for_path(DAEMON_DIR).query_exists(null))
+                return false;
+            Gio.File.new_for_path(path).replace_contents(
+                value + String.fromCharCode(10), null, false,
+                Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+            return true;
         } catch (e) {
-            this._uperfState = 'unknown';
-            console.error('[powermode] 调用 uperf 失败: ' + e.message);
+            console.warn('[powermode] 写状态失败 ' + path + ': ' + e.message);
+            return false;
         }
     }
 
-/**
+    /**
      * 给所有 OSD 进度条染色。
      *
      * BarLevel 是 St.DrawingArea，颜色不走普通 CSS 类，而是在
