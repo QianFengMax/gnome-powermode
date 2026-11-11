@@ -44,6 +44,32 @@ const META = {
 
 const FALLBACK = ['power-saver', 'balanced', 'performance'];
 
+/**
+ * uperf-linux 适配。
+ *
+ * 这台机器上电源管理分两层：
+ *   - UPower PowerProfiles（GNOME 认的那个）：tlp-pd 提供的只是状态标记，
+ *     切换它不会改变任何 CPU 参数。
+ *   - uperf-linux（系统级调频守护）：真正控制每簇 scaling_max_freq。
+ *
+ * 实测：uperf 从 balance 切到 performance 会把 policy0 上限从 1459MHz
+ * 抬到 2016MHz、policy7 从 2093MHz 抬到 2957MHz；GNOME 档位切了则毫无变化。
+ * 所以切换时两边都要动，否则界面显示变了、功耗没变。
+ *
+ * 命名也不一致，需要映射。uperf 通过系统 D-Bus 的 SetMode 设值，
+ * 普通用户可直接调用（polkit 允许 active 会话）。
+ */
+const UPERF_NAME = 'org.uperflinux.Daemon';
+const UPERF_PATH = '/org/uperflinux/Daemon';
+const UPERF_IFACE = 'org.uperflinux.Daemon';
+
+/** GNOME 档位 -> uperf 模式 */
+const UPERF_ALIAS = {
+    'power-saver': 'powersave',
+    'balanced': 'balance',
+    'performance': 'performance',
+};
+
 export class Impl {
     constructor(ext) {
         this._ext = ext;
@@ -54,6 +80,7 @@ export class Impl {
 
     enable() {
         this._settings = this._ext.getSettings();
+        this._uperfState = 'unknown';
 
         this._proxy = new Gio.DBusProxy({
             g_connection: Gio.DBus.system,
@@ -151,6 +178,7 @@ export class Impl {
                     logError(e, 'powermode: 切换电源模式失败');
                     return;
                 }
+                this._syncUperf(next);
                 this._showOsd(next);
             });
     }
@@ -181,6 +209,68 @@ export class Impl {
     }
 
     /**
+     * 把档位同步给 uperf。
+     *
+     * 为什么需要：GNOME 的 PowerProfiles 在这台机器上只标记不执行，
+     * 真正调频的是 uperf。不同步的话按快捷键只有界面在动。
+     *
+     * uperf 没装/没运行时不报错也不提示，静默跳过——那样扩展退回
+     * 原本的「只切 GNOME 档位」行为，不影响没有 uperf 的机器。
+     */
+    _syncUperf(profile) {
+        if (!this._settings?.get_boolean('sync-uperf'))
+            return;
+
+        const mode = UPERF_ALIAS[profile];
+        if (!mode || this._uperfState === 'absent')
+            return;
+
+        // 'unknown' 时先探一次，避免每次按键都对不存在的服务发起调用
+        if (this._uperfState === 'unknown') {
+            this._uperfState = 'probing';
+            Gio.DBus.system.call(
+                UPERF_NAME, UPERF_PATH, 'org.freedesktop.DBus.Properties', 'Get',
+                new GLib.Variant('(ss)', [UPERF_IFACE, 'CurrentMode']),
+                null, Gio.DBusCallFlags.NONE, 500, null,
+                (conn, res) => {
+                    try {
+                        conn.call_finish(res);
+                        this._uperfState = 'present';
+                        console.log('[powermode] 检测到 uperf，接管调频');
+                        this._sendUperf(mode);
+                    } catch {
+                        this._uperfState = 'absent';
+                        console.log('[powermode] 无 uperf，仅切换 GNOME 档位');
+                    }
+                });
+            return;
+        }
+
+        this._sendUperf(mode);
+    }
+
+    _sendUperf(mode) {
+        try {
+            Gio.DBus.system.call(
+                UPERF_NAME, UPERF_PATH, UPERF_IFACE, 'SetMode',
+                new GLib.Variant('(s)', [mode]),
+                null, Gio.DBusCallFlags.NONE, 800, null,
+                (conn, res) => {
+                    try {
+                        conn.call_finish(res);
+                    } catch (e) {
+                        // 运行中掉线：下次按键重新探一次
+                        this._uperfState = 'unknown';
+                        console.warn('[powermode] uperf SetMode 失败: ' + e.message);
+                    }
+                });
+        } catch (e) {
+            this._uperfState = 'unknown';
+            console.error('[powermode] 调用 uperf 失败: ' + e.message);
+        }
+    }
+
+/**
      * 给所有 OSD 进度条染色。
      *
      * BarLevel 是 St.DrawingArea，颜色不走普通 CSS 类，而是在
