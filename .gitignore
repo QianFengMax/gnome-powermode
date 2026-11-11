@@ -1,0 +1,6 @@
+# 测试/构建残留
+.tmp/
+*.log
+
+# 编译产物（gschemas.compiled 由 install.sh 生成）
+extension/*/schemas/gschemas.compiled
