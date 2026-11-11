@@ -11,8 +11,16 @@
 
     <key name="show-notification" type="b">
       <default>true</default>
-      <summary>切换后显示通知</summary>
-      <description>关闭后切换不弹提示。</description>
+      <summary>显示 OSD</summary>
+      <description>关闭后切换时不显示屏幕中下方的提示条。</description>
+    </key>
+
+    <key name="sync-uperf" type="b">
+      <default>true</default>
+      <summary>同步 uperf 调频守护</summary>
+      <description>若系统装有 uperf-linux，切换档位时同时调整它的模式。
+                  这台机器上 UPower 的档位只是状态标记，真正控制 CPU 频率的是 uperf；
+                  不同步的话界面变了功耗不变。没装 uperf 时此开关无副作用。</description>
     </key>
 
   </schema>
