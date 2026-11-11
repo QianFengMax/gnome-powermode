@@ -1,0 +1,8 @@
+{
+  "uuid": "powermode@local",
+  "name": "Power Mode Shortcut · 电源模式快捷键",
+  "description": "用一个快捷键在电源模式之间循环（省电 / 平衡 / 性能）。空闲时零开销。",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "settings-schema": "org.gnome.shell.extensions.powermode",
+  "version": 1
+}
